@@ -1,0 +1,59 @@
+=== ICH Hemorrhage Detection Experiment Results ===
+
+--- Tuned Hyperparameters ---
+RandomForest: {'n_estimators': 200, 'min_samples_split': 5, 'max_depth': 30, 'class_weight': 'balanced_subsample'}
+XGBoost: {'subsample': 0.8, 'scale_pos_weight': 10, 'n_estimators': 200, 'max_depth': 10, 'learning_rate': 0.1}
+LogisticRegression: {'solver': 'lbfgs', 'class_weight': 'balanced', 'C': 0.1}
+
+--- Model Performance ---
+Model: RandomForest
+  10_fold_cv_mean: 0.8340
+  fixed_test_accuracy: 0.8357
+  precision: 0.4410
+  recall: 0.2368
+  f1_score: 0.2851
+  roc_auc: 0.7735
+  train_time: 5.9340
+
+Model: SVM
+  10_fold_cv_mean: 0.7060
+  fixed_test_accuracy: 0.7028
+  precision: 0.3748
+  recall: 0.7408
+  f1_score: 0.4615
+  roc_auc: 0.7775
+  train_time: 0.1676
+
+Model: XGBoost
+  10_fold_cv_mean: 0.8127
+  fixed_test_accuracy: 0.8124
+  precision: 0.3973
+  recall: 0.4175
+  f1_score: 0.4063
+  roc_auc: 0.7669
+  train_time: 4.2140
+
+Model: LogisticRegression
+  10_fold_cv_mean: 0.7065
+  fixed_test_accuracy: 0.7047
+  precision: 0.3761
+  recall: 0.7350
+  f1_score: 0.4628
+  roc_auc: 0.7778
+  train_time: 0.1523
+
+Model: MLP
+  10_fold_cv_mean: 0.7517
+  fixed_test_accuracy: 0.7626
+  precision: 0.3958
+  recall: 0.7010
+  f1_score: 0.4885
+  roc_auc: 0.8005
+  train_time: 96.9050
+
+--- Statistical Significance (Paired t-test vs MLP) ---
+MLP vs RandomForest: t=-19.4495, p=0.0000 (Significant)
+MLP vs SVM: t=11.0945, p=0.0000 (Significant)
+MLP vs XGBoost: t=-16.2851, p=0.0000 (Significant)
+MLP vs LogisticRegression: t=10.9558, p=0.0000 (Significant)
+
