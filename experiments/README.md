@@ -8,6 +8,8 @@ set PY=C:\Users\bahra\anaconda3\envs\researchenv\python.exe
 %PY% -m pip install "numpy<2.5" pandas pyarrow scipy scikit-learn xgboost matplotlib optuna
 git lfs pull
 
+:: one command does everything below (resumable): experiments\run_all.bat
+
 :: 1) tune hyperparameters on the development pool only (test set untouched)
 %PY% experiments\tune.py --dataset sino --device cuda
 %PY% experiments\tune.py --dataset ich  --device cuda

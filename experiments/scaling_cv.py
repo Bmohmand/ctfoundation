@@ -644,3 +644,4 @@ if __name__ == "__main__":
     keep_awake()
     run(a.dataset, a.models or DEFAULT_MODELS[a.dataset], sorted(a.ratios), a.seeds, a.repeat_max_ratio,
         a.device, a.n_boot)
+    print(f"[{a.dataset}] scaling run complete", flush=True)
