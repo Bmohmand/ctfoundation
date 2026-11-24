@@ -83,7 +83,9 @@ def load_dataset(name):
     X = _parse(df)
     info["rows_used"] = len(df)
     os.makedirs(os.path.dirname(cache), exist_ok=True)
-    np.savez(cache, X=X, Y=Y, labels=np.array(labels), info=json.dumps(info))
+    tmp = cache + ".tmp.npz"  # write-then-rename so an interrupted first run can't leave a corrupt cache
+    np.savez(tmp, X=X, Y=Y, labels=np.array(labels), info=json.dumps(info))
+    os.replace(tmp, cache)
     return X, Y, labels, info
 
 
@@ -362,10 +364,23 @@ def run(dataset, models, ratios, folds, device, n_boot):
         path = os.path.join(out_dir, f"{name}.jsonl")
         done = set()
         if os.path.exists(path):
+            # A size counts as done only once its final 'test' record exists. Drop malformed lines and
+            # records of sizes that were interrupted mid-run, so a rerun can't double-count their folds.
+            recs_ok = []
             for line in open(path):
-                r = json.loads(line)
-                if r["scheme"] == "test":
-                    done.add(round(r["ratio"], 4))
+                try:
+                    recs_ok.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            done = {round(r["ratio"], 4) for r in recs_ok if r.get("scheme") == "test"}
+            keep = [r for r in recs_ok if round(r["ratio"], 4) in done]
+            if len(keep) != len(recs_ok):
+                print(f"[{dataset}] {name}: discarding {len(recs_ok) - len(keep)} records from an interrupted run",
+                      flush=True)
+                tmp = path + ".tmp"
+                with open(tmp, "w") as fh:
+                    fh.writelines(json.dumps(r) + "\n" for r in keep)
+                os.replace(tmp, path)
         make = model_factory(dataset, name, device)
         for ratio in ratios:
             if round(ratio, 4) in done:
@@ -402,10 +417,13 @@ def run(dataset, models, ratios, folds, device, n_boot):
                          "ci95": bootstrap_ci(Y[test], S, T, labels, n=n_boot)})
             np.savez_compressed(os.path.join(out_dir, "scores", f"{name}_r{int(round(ratio * 100)):03d}.npz"),
                                 y=Y[test], s=S, t=T)
-            with open(path, "a") as fh:
-                for r in recs:
-                    fh.write(json.dumps(clean({"dataset": dataset, "model": name, "ratio": ratio,
-                                               "n_train": n, "n_pos_train": int(strat.sum()), **r})) + "\n")
+            block = "".join(json.dumps(clean({"dataset": dataset, "model": name, "ratio": ratio,
+                                              "n_train": n, "n_pos_train": int(strat.sum()), **r})) + "\n"
+                            for r in recs)
+            with open(path, "a") as fh:  # one write per finished size, flushed to disk
+                fh.write(block)
+                fh.flush()
+                os.fsync(fh.fileno())
             o = test_m["overall"]
             print(f"[{dataset}] {name:5s} {ratio*100:5.1f}% n={n:5d} test AUC={o.get('auc', float('nan')):.3f} "
                   f"AP={o.get('ap', float('nan')):.3f} F1={o.get('f1', float('nan')):.3f} "

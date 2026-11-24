@@ -14,8 +14,10 @@ python experiments/make_report.py --dataset ich
 python experiments/make_report.py --dataset sino
 ```
 
-Runs are resumable: each finished (model, training size) is appended to
-`results/<dataset>/<model>.jsonl` and skipped on the next run.
+Runs are resumable: rerun the same command after a crash. Each finished (model, training size)
+is written to `results/<dataset>/<model>.jsonl` in one flushed write and skipped next time; a size
+that was interrupted mid-CV is discarded and redone from scratch. Checkpoints are per training
+size, not per fold, so at most one size's work is lost.
 
 ## Protocol
 
