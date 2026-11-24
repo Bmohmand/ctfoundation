@@ -1,27 +1,20 @@
 """
 Unified decoder evaluation on Google CT-FM embeddings (ICH + SinoCT).
 
-For each dataset:
-  1. Load + de-duplicate embeddings (cached to .npz after first parse).
-  2. Hold out ONE fixed, stratified 20% test set (never used for training,
-     tuning, early stopping or threshold selection).
-  3. Order the remaining development pool once with a fixed seed, stratified so
-     every prefix keeps the class balance. Training subset r% = first r% of that
-     order, so subsets are NESTED (every scan in the 5% subset is also in 10%,
-     20%, ...) and identical across models.
-  4. For every subset size and every model:
-       - 3-, 5- and 10-fold stratified CV inside the subset
-       - refit on the whole subset, evaluate on the fixed test set
-         (threshold = mean of the Youden-J thresholds from the 3/5/10-fold
-          out-of-fold predictions, the same rule as the ASFNR slides)
-       - bootstrap 95% CIs on the test metrics
-  5. Append results to results/<dataset>/<model>.jsonl (resumable) and save
-     test-set scores for ROC plots.
+Protocol (details in experiments/README.md):
+  1. Load + de-duplicate embeddings (cached to cache/<dataset>.npz).
+  2. ONE fixed, stratified 20% test set. It is never used for training, hyperparameter
+     tuning, early stopping or threshold selection.
+  3. The development pool is ordered once per seed (stratified), and training subset r% is
+     the first r% of that order, so subsets are NESTED and shared by every model.
+  4. For every (seed, size, model): 3-, 5- and 10-fold stratified CV inside the subset, then a
+     refit on the whole subset scored on the fixed test set with bootstrap 95% CIs.
+  5. Hyperparameters come from experiments/tune.py (tuned on the development pool only).
 
 Usage:
-  python experiments/scaling_cv.py --dataset ich  --models LR SVM RF XGB MLP5 MLP7
-  python experiments/scaling_cv.py --dataset sino --models LR SVM RF XGB MLP3 MLP5
-  (add --ratios 0.01 0.02 ... to restrict, --device cuda on a GPU box)
+  python experiments/tune.py       --dataset ich  --device cuda
+  python experiments/scaling_cv.py --dataset ich  --device cuda
+  python experiments/scaling_cv.py --dataset sino --device cuda --models LR SVM KNN MLP-focal
 """
 import argparse
 import hashlib
@@ -35,6 +28,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC, LinearSVC
 
@@ -43,9 +37,13 @@ SEED = 42
 RATIOS = [0.01, 0.02, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 1.00]
 FOLDS = [3, 5, 10]
 ICH_LABELS = ["any", "epidural", "intraparenchymal", "intraventricular", "subarachnoid", "subdural"]
+DEFAULT_MODELS = {
+    "ich": ["LR", "SVM", "KNN", "RF", "XGB", "MLP", "MLP-focal", "MLP5", "MLP7"],
+    "sino": ["LR", "SVM", "KNN", "RF", "XGB", "MLP", "MLP-focal", "MLP3", "MLP5"],
+}
 
 
-# ----------------------------------------------------------------------------- data
+# ============================================================================ data
 def _parse(df):
     return np.stack([np.asarray(json.loads(s), dtype=np.float32) for s in df["embedding"]])
 
@@ -54,14 +52,16 @@ def load_dataset(name):
     cache = os.path.join(ROOT, "cache", f"{name}.npz")
     if os.path.exists(cache):
         d = np.load(cache, allow_pickle=True)
-        return d["X"], d["Y"], list(d["labels"]), dict(json.loads(str(d["info"])))
+        info = dict(json.loads(str(d["info"])))
+        if info.get("version") == 2:
+            return d["X"], d["Y"], list(d["labels"]), info
 
-    info = {}
+    info = {"version": 2}
     if name == "ich":
         df = pd.concat([pd.read_csv(os.path.join(ROOT, "Rsna_ICH_Hemm.csv")),
                         pd.read_csv(os.path.join(ROOT, "Rsna_ICH_Control.csv"))], ignore_index=True)
         info["rows_raw"] = len(df)
-        # exact-duplicate embeddings: keep one copy if labels agree, drop all if they conflict
+        # exact-duplicate embeddings: keep one copy if labels agree, drop the group if they conflict
         df["h"] = df["embedding"].map(lambda s: hashlib.md5(s.encode()).hexdigest())
         conflict = df.groupby("h")[ICH_LABELS].nunique().max(axis=1) > 1
         info["dup_embedding_rows_dropped"] = int(df.duplicated("h").sum())
@@ -74,9 +74,11 @@ def load_dataset(name):
         info["rows_raw"] = len(df)
         info["dup_url_rows_dropped"] = int(df.duplicated("url").sum())
         df = df.drop_duplicates("url")
-        labels = ["label"]
-        # same mapping as NewSinoCTModels.py: '1,0' -> 1, '0,1' -> 0
-        Y = (df["label"] == "1,0").values.astype(np.float32)[:, None]
+        labels = ["abnormal"]
+        # one-hot [normal, abnormal]: "1,0" = normal, "0,1" = abnormal (see OIdSinoCTModels notebooks).
+        # Positive class = ABNORMAL. NewSinoCTModels.py used normal as positive.
+        Y = (df["label"] == "0,1").values.astype(np.float32)[:, None]
+        info["positive_class"] = "abnormal ('0,1')"
     else:
         raise ValueError(name)
 
@@ -89,9 +91,9 @@ def load_dataset(name):
     return X, Y, labels, info
 
 
-def nested_order(strat, seed=SEED):
-    """Stratified permutation: each class is shuffled and the classes are interleaved
-    by fractional rank, so any prefix has ~the pool's class balance."""
+def nested_order(strat, seed):
+    """Stratified permutation: each class is shuffled and the classes are interleaved by
+    fractional rank, so every prefix has ~the pool's class balance."""
     rng = np.random.default_rng(seed)
     key = np.empty(len(strat))
     for c in np.unique(strat):
@@ -101,37 +103,50 @@ def nested_order(strat, seed=SEED):
     return np.argsort(key, kind="stable")
 
 
-def make_splits(Y):
-    strat = Y[:, 0].astype(int)  # 'any' for ICH, label for SinoCT
+def make_splits(Y, order_seed=SEED):
+    """Test split is always the same (SEED); only the dev-pool ordering depends on order_seed."""
+    strat = Y[:, 0].astype(int)  # 'any' for ICH, abnormal for SinoCT
     idx = np.arange(len(Y))
     dev, test = train_test_split(idx, test_size=0.2, stratify=strat, random_state=SEED)
-    dev = dev[nested_order(strat[dev])]
+    dev = np.sort(dev)
+    dev = dev[nested_order(strat[dev], order_seed)]
     return dev, test
 
 
-# ----------------------------------------------------------------------------- models
+# ============================================================================ models
 class TorchMLP:
-    """Binary/multilabel MLP with BCE (+pos_weight), early stopping on an inner 10%
-    validation split taken from the TRAINING data only."""
+    """Binary/multilabel MLP. loss: 'bce' | 'wbce' (pos_weight) | 'focal' (gamma=2).
+    Early stopping on a 10% split carved from the TRAINING data only.
 
-    def __init__(self, hidden, dropout, lr, residual_first=False, pos_weight=True,
-                 plateau=False, max_epochs=50, patience=5, batch_size=32, device="cpu"):
-        self.hidden, self.dropout, self.lr = hidden, dropout, lr
-        self.residual_first, self.pos_weight, self.plateau = residual_first, pos_weight, plateau
-        self.max_epochs, self.patience, self.batch_size, self.device = max_epochs, patience, batch_size, device
+    Training budget is size-aware: at least `min_steps` gradient updates (so tiny subsets, which
+    have only a few batches per epoch, are not stopped after a few dozen updates), and early
+    stopping cannot trigger during the first 20% of the budget. At full size this reduces to the
+    original 50 epochs / patience 5."""
+
+    def __init__(self, hidden, dropout, lr, loss="wbce", residual_first=False, plateau=False,
+                 max_epochs=50, patience=5, batch_size=32, device="cpu", seed=SEED, gamma=2.0,
+                 min_steps=3000, max_epochs_cap=500):
+        self.hidden, self.dropout, self.lr, self.loss = list(hidden), list(dropout), lr, loss
+        self.residual_first, self.plateau, self.max_epochs = residual_first, plateau, max_epochs
+        # with an LR-on-plateau scheduler (patience 5), give it room to act before stopping
+        self.patience = max(patience, 10) if plateau else patience
+        self.batch_size, self.device, self.seed, self.gamma = batch_size, device, seed, gamma
+        self.min_steps, self.max_epochs_cap = min_steps, max_epochs_cap
 
     def _build(self, d_in, d_out):
         import torch.nn as nn
+
+        hidden, dropout, residual = self.hidden, self.dropout, self.residual_first
 
         class Net(nn.Module):
             def __init__(s):
                 super().__init__()
                 blocks, prev = [], d_in
-                for h, p in zip(self.hidden, self.dropout):
+                for h, p in zip(hidden, dropout):
                     blocks.append(nn.Sequential(nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(p)))
                     prev = h
                 s.blocks = nn.ModuleList(blocks)
-                s.res = nn.Linear(d_in, self.hidden[0]) if self.residual_first else None
+                s.res = nn.Linear(d_in, hidden[0]) if residual else None
                 s.out = nn.Linear(prev, d_out)
 
             def forward(s, x):
@@ -144,14 +159,32 @@ class TorchMLP:
 
         return Net()
 
+    def _criterion(self, pos_weight):
+        import torch
+        import torch.nn.functional as F
+
+        if self.loss == "bce":
+            return lambda z, y: F.binary_cross_entropy_with_logits(z, y)
+        if self.loss == "wbce":
+            return lambda z, y: F.binary_cross_entropy_with_logits(z, y, pos_weight=pos_weight)
+        if self.loss == "focal":
+            g = self.gamma
+
+            def focal(z, y):
+                ce = F.binary_cross_entropy_with_logits(z, y, reduction="none")
+                p_t = torch.exp(-ce)
+                return ((1 - p_t) ** g * ce).mean()
+            return focal
+        raise ValueError(self.loss)
+
     def fit(self, X, Y):
         import torch
         import torch.nn as nn
-        torch.manual_seed(SEED)
+        torch.manual_seed(self.seed)
         Y = Y.reshape(len(Y), -1)
         strat = Y[:, 0].astype(int)
-        can_strat = np.bincount(strat).min() >= 2
-        tr, va = train_test_split(np.arange(len(X)), test_size=0.1, random_state=SEED,
+        can_strat = np.bincount(strat, minlength=2).min() >= 2
+        tr, va = train_test_split(np.arange(len(X)), test_size=0.1, random_state=self.seed,
                                   stratify=strat if can_strat else None)
         self.scaler = StandardScaler().fit(X[tr])
         dev = self.device
@@ -161,19 +194,21 @@ class TorchMLP:
         Yv = torch.tensor(Y[va], dtype=torch.float32, device=dev)
 
         self.net = self._build(X.shape[1], Y.shape[1]).to(dev)
-        pw = None
-        if self.pos_weight:
-            pos = Y[tr].sum(0)
-            pw = torch.tensor((len(tr) - pos) / np.maximum(pos, 1), dtype=torch.float32, device=dev)
-        crit = nn.BCEWithLogitsLoss(pos_weight=pw)
+        pos = Y[tr].sum(0)
+        pw = torch.tensor((len(tr) - pos) / np.maximum(pos, 1), dtype=torch.float32, device=dev)
+        crit = self._criterion(pw)
         opt = torch.optim.Adam(self.net.parameters(), lr=self.lr)
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5) if self.plateau else None
 
+        steps_per_epoch = max(1, int(np.ceil(len(tr) / self.batch_size)))
+        max_epochs = min(self.max_epochs_cap, max(self.max_epochs, int(np.ceil(self.min_steps / steps_per_epoch))))
+        patience = max(self.patience, int(round(self.patience * max_epochs / self.max_epochs)))
+        warmup = int(0.2 * max_epochs) if max_epochs > self.max_epochs else 0
         best, best_state, bad = np.inf, None, 0
-        g = torch.Generator(device="cpu").manual_seed(SEED)
-        for _ in range(self.max_epochs):
+        g = torch.Generator(device="cpu").manual_seed(self.seed)
+        for epoch in range(max_epochs):
             self.net.train()
-            perm = torch.randperm(len(Xt), generator=g)
+            perm = torch.randperm(len(Xt), generator=g).to(dev)
             for i in range(0, len(Xt), self.batch_size):
                 b = perm[i:i + self.batch_size]
                 if len(b) < 2:  # BatchNorm needs >1 sample
@@ -188,14 +223,15 @@ class TorchMLP:
                 vl = crit(self.net(Xv), Yv).item()
             if sched:
                 sched.step(vl)
-            if vl < best - 1e-4:
+            if best_state is None or vl < best - 1e-4:
                 best, bad = vl, 0
                 best_state = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
-            else:
+            elif epoch >= warmup:
                 bad += 1
-                if bad >= self.patience:
+                if bad >= patience:
                     break
         self.net.load_state_dict(best_state)
+        self.best_val_loss, self.epochs_run = best, epoch + 1
         return self
 
     def score(self, X):
@@ -207,7 +243,7 @@ class TorchMLP:
 
 
 class PerLabel:
-    """One scaled sklearn estimator per label; returns continuous scores."""
+    """One standardized sklearn estimator per label; returns continuous scores."""
 
     def __init__(self, make):
         self.make = make
@@ -238,55 +274,148 @@ class PerLabel:
         return np.column_stack(out)
 
 
-def model_factory(dataset, name, device):
+class InnerCVKNN:
+    """Cosine k-NN on standardized embeddings. k is re-selected at EVERY fit by 3-fold CV on the
+    training data (AUC on the first label), so it adapts to the training-set size."""
+    K_GRID = (1, 3, 5, 10, 20, 50, 100)
+
+    def __init__(self, seed=SEED):
+        self.seed = seed
+
+    def _knn(self, k):
+        return KNeighborsClassifier(n_neighbors=k, metric="cosine", weights="distance", algorithm="brute")
+
+    def fit(self, X, Y):
+        Y = Y.reshape(len(Y), -1)
+        self.scaler = StandardScaler().fit(X)
+        Xs = self.scaler.transform(X)
+        y0 = Y[:, 0].astype(int)
+        n_inner = 3 if np.bincount(y0, minlength=2).min() >= 3 else 0
+        max_k = int(len(X) * (2 / 3)) - 1
+        grid = [k for k in self.K_GRID if k <= max_k] or [1]
+        if n_inner and len(grid) > 1:
+            scores = {k: [] for k in grid}
+            for tr, va in StratifiedKFold(n_inner, shuffle=True, random_state=self.seed).split(Xs, y0):
+                if y0[va].min() == y0[va].max():
+                    continue
+                for k in grid:
+                    s = self._knn(k).fit(Xs[tr], y0[tr]).predict_proba(Xs[va])
+                    scores[k].append(roc_auc_score(y0[va], s[:, 1] if s.shape[1] > 1 else s[:, 0]))
+            self.k = max(grid, key=lambda k: np.mean(scores[k]) if scores[k] else -1)
+        else:
+            self.k = grid[-1]
+        self.k = min(self.k, len(X) - 1)
+        self.models = []
+        for j in range(Y.shape[1]):
+            y = Y[:, j].astype(int)
+            self.models.append(float(y[0]) if y.min() == y.max() else self._knn(self.k).fit(Xs, y))
+        return self
+
+    def score(self, X):
+        Xs = self.scaler.transform(X)
+        return np.column_stack([np.full(len(X), m) if isinstance(m, float) else m.predict_proba(Xs)[:, 1]
+                                for m in self.models])
+
+
+def load_params(dataset):
+    p = os.path.join(ROOT, "results", dataset, "tuned_params.json")
+    return json.load(open(p))["best"] if os.path.exists(p) else None
+
+
+C_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1, 10, 100)
+RBF_C_GRID = (0.1, 0.3, 1, 3, 10)
+PER_SIZE_C = {"LR", "SVM"}  # regularization strength re-selected on each training subset
+
+
+def select_C(dataset, name, device, seed, params, X, Y):
+    """Pick C for LR/SVM by 3-fold CV on the TRAINING SUBSET only (AUC on the first label), using the
+    one-standard-error rule: the most regularized C whose mean CV AUC is within 1 SE of the best.
+    Small subsets therefore get stronger regularization than the full pool. Other tuned params are kept."""
+    y0 = Y[:, 0].astype(int)
+    if np.bincount(y0, minlength=2).min() < 3:
+        return None
+    grid = RBF_C_GRID if (dataset == "sino" and name.partition("-")[0] == "SVM") else C_GRID
+    folds = list(StratifiedKFold(3, shuffle=True, random_state=seed).split(X, y0))
+    stats = []
+    for C in grid:  # ascending C = decreasing regularization
+        make = model_factory(dataset, name, device, seed, params, overrides={"C": C})
+        aucs = []
+        for tr, va in folds:
+            if y0[va].min() == y0[va].max():
+                continue
+            aucs.append(roc_auc_score(y0[va], make().fit(X[tr], Y[tr]).score(X[va])[:, 0]))
+        stats.append((C, np.mean(aucs), np.std(aucs, ddof=1) / np.sqrt(len(aucs)) if len(aucs) > 1 else 0.0))
+    best = max(stats, key=lambda t: t[1])
+    return next(C for C, mu, _ in stats if mu >= best[1] - best[2])
+
+
+def model_factory(dataset, name, device, seed=SEED, params=None, overrides=None):
+    """name = BASE or BASE-LOSS for MLPs (e.g. 'MLP-focal', 'MLP7-bce')."""
     from xgboost import XGBClassifier
 
-    if dataset == "ich":
-        # tree/LR settings = tuned values in ich_results.txt (tuned on the training pool, 'any' label)
-        zoo = {
-            "LR": lambda: PerLabel(lambda y: LogisticRegression(C=0.1, class_weight="balanced", max_iter=2000)),
-            # C chosen by 3-fold CV on the 20% dev subset (C=0.001: 0.758, 0.01: 0.752, 0.1: 0.748 macro AUC);
-            # the old C=1 barely converges at 1408 dims and is ~10x slower
-            "SVM": lambda: PerLabel(lambda y: LinearSVC(C=0.001, class_weight="balanced", dual=False, max_iter=5000)),
-            "RF": lambda: PerLabel(lambda y: RandomForestClassifier(
-                n_estimators=200, max_depth=30, min_samples_split=5, class_weight="balanced_subsample",
-                n_jobs=-1, random_state=SEED)),
-            "XGB": lambda: PerLabel(lambda y: XGBClassifier(
-                n_estimators=200, max_depth=10, learning_rate=0.1, subsample=0.8, scale_pos_weight=10,
-                tree_method="hist", device=device, n_jobs=-1, random_state=SEED, eval_metric="logloss")),
-            # "5-layer" MLP from MLP.ipynb: 1408 -> 128 -> 64 -> 6
-            "MLP5": lambda: TorchMLP([128, 64], [0.5, 0.5], lr=1e-3, device=device),
-            # "7-layer" Optuna architecture (model_hyperparameters.json)
-            "MLP7": lambda: TorchMLP([807, 467, 258, 180, 126, 85, 43],
-                                     [0.192, 0.252, 0.398, 0.441, 0.411, 0.411, 0.175],
-                                     lr=1.8774581889e-4, device=device),
-        }
-    else:
-        zoo = {
-            "LR": lambda: PerLabel(lambda y: LogisticRegression(C=1.0, max_iter=2000)),
-            # RBF SVC as in NewSinoCTModels.py; decision_function scores instead of Platt probabilities
-            "SVM": lambda: PerLabel(lambda y: SVC(kernel="rbf", random_state=SEED)),
-            "RF": lambda: PerLabel(lambda y: RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=SEED)),
-            "XGB": lambda: PerLabel(lambda y: XGBClassifier(
-                n_estimators=100, tree_method="hist", device=device, n_jobs=-1, random_state=SEED,
-                eval_metric="logloss")),
-            # "3-layer" MLP from KFoldMLP.ipynb: 1408 -> 1536 -> 896 -> 128 -> 1
-            "MLP3": lambda: TorchMLP([1536, 896, 128], [0.4373, 0.3418, 0.2426], lr=1e-3,
-                                     pos_weight=False, plateau=True, device=device),
-            # "5-layer" SinoMLP from NewSinoCTModels.py: 1024(+residual) -> 512 -> 256 -> 128 -> 1
-            "MLP5": lambda: TorchMLP([1024, 512, 256, 128], [0.1, 0.2, 0.3, 0.4], lr=1e-3,
-                                     residual_first=True, pos_weight=False, device=device),
-        }
-    return zoo[name]
+    base, _, loss = name.partition("-")
+    need_tuned = {"LR", "SVM", "RF", "XGB", "MLP"}
+    if base in need_tuned and not (params and base in params):
+        raise SystemExit(f"No tuned parameters for {base}. Run: python experiments/tune.py --dataset {dataset}")
+    P = {**(params.get(base, {}) if params else {}), **(overrides or {})}
+    default_loss = "wbce" if dataset == "ich" else "bce"
+    loss = loss or default_loss
+
+    if base == "LR":
+        return lambda: PerLabel(lambda y: LogisticRegression(max_iter=3000, **P))
+    if base == "SVM":
+        if dataset == "ich":  # linear SVM as in the deck (RBF is O(n^2) on 13k scans x 6 labels)
+            return lambda: PerLabel(lambda y: LinearSVC(dual=False, max_iter=5000, **P))
+        return lambda: PerLabel(lambda y: SVC(kernel="rbf", random_state=seed, **P))
+    if base == "KNN":
+        return lambda: InnerCVKNN(seed=seed)
+    if base == "RF":
+        return lambda: PerLabel(lambda y: RandomForestClassifier(n_jobs=-1, random_state=seed, **P))
+    if base == "XGB":
+        return lambda: PerLabel(lambda y: XGBClassifier(tree_method="hist", device=device, n_jobs=-1,
+                                                        random_state=seed, eval_metric="logloss", **P))
+    if base == "MLP":  # architecture/lr from the Optuna search in tune.py (dev pool only)
+        return lambda: TorchMLP(P["hidden"], P["dropout"], P["lr"], loss=loss, device=device, seed=seed)
+
+    # ---- legacy MLPs, exactly as in the deck (for continuity; see README caveats) ----
+    if dataset == "ich" and base == "MLP5":  # MLP.ipynb: 1408 -> 128 -> 64 -> 6
+        return lambda: TorchMLP([128, 64], [0.5, 0.5], 1e-3, loss=loss, device=device, seed=seed)
+    if dataset == "ich" and base == "MLP7":  # Optuna architecture in model_hyperparameters.json
+        return lambda: TorchMLP([807, 467, 258, 180, 126, 85, 43],
+                                [0.192, 0.252, 0.398, 0.441, 0.411, 0.411, 0.175],
+                                1.8774581889e-4, loss=loss, device=device, seed=seed)
+    if dataset == "sino" and base == "MLP3":  # KFoldMLP.ipynb: 1408 -> 1536 -> 896 -> 128 -> 1
+        return lambda: TorchMLP([1536, 896, 128], [0.4373, 0.3418, 0.2426], 1e-3, loss=loss,
+                                plateau=True, device=device, seed=seed)
+    if dataset == "sino" and base == "MLP5":  # NewSinoCTModels.py SinoMLP: 1024(+res) -> 512 -> 256 -> 128 -> 1
+        return lambda: TorchMLP([1024, 512, 256, 128], [0.1, 0.2, 0.3, 0.4], 1e-3, loss=loss,
+                                residual_first=True, device=device, seed=seed)
+    raise SystemExit(f"Unknown model {name} for {dataset}")
 
 
-# ----------------------------------------------------------------------------- metrics
+# ============================================================================ metrics
 def youden(y, s):
     if y.min() == y.max():
         return np.nan
     fpr, tpr, thr = roc_curve(y, s)
-    t = thr[np.argmax(tpr - fpr)]
-    return float(min(t, np.max(s)))  # roc_curve's first threshold can be +inf
+    return float(min(thr[np.argmax(tpr - fpr)], np.max(s)))  # first roc threshold can be +inf
+
+
+def f1_opt(y, s):
+    if y.min() == y.max():
+        return np.nan
+    order = np.argsort(-s)
+    ys, ss = y[order], s[order]
+    tp = np.cumsum(ys); fp = np.cumsum(1 - ys); fn = ys.sum() - tp
+    f1 = 2 * tp / np.maximum(2 * tp + fp + fn, 1)
+    last = np.r_[ss[1:] != ss[:-1], True]  # only cut between distinct scores
+    i = np.argmax(np.where(last, f1, -1))
+    return float(ss[i])
+
+
+def thresholds(Y, S, rule):
+    fn = youden if rule == "youden" else f1_opt
+    return np.array([fn(Y[:, j].astype(int), S[:, j]) for j in range(Y.shape[1])])
 
 
 def binary_metrics(y, s, t):
@@ -310,9 +439,8 @@ def all_metrics(Y, S, T, labels):
     per = {lab: binary_metrics(Y[:, j].astype(int), S[:, j], T[j]) for j, lab in enumerate(labels)}
     if len(labels) == 1:
         return {"overall": per[labels[0]], "per_label": per}
-    keys = ["auc", "ap", "acc", "sens", "spec", "prec", "f1"]
     macro = {}
-    for k in keys:
+    for k in ["auc", "ap", "acc", "sens", "spec", "prec", "f1"]:
         v = [per[l][k] for l in labels if k in per[l] and not np.isnan(per[l][k])]
         if v:
             macro[k] = float(np.mean(v))
@@ -320,15 +448,19 @@ def all_metrics(Y, S, T, labels):
     return {"overall": macro, "per_label": per}
 
 
-def bootstrap_ci(Y, S, T, labels, n=1000, seed=SEED):
+def bootstrap_indices(Y, n, seed=SEED):
+    """Stratified (on the first label) bootstrap resamples of the test set. Same indices for every
+    model, so paired model comparisons can reuse them."""
     rng = np.random.default_rng(seed)
     strat = Y[:, 0].astype(int)
     pos, neg = np.flatnonzero(strat == 1), np.flatnonzero(strat == 0)
+    return [np.concatenate([rng.choice(pos, len(pos)), rng.choice(neg, len(neg))]) for _ in range(n)]
+
+
+def bootstrap_ci(Y, S, T, labels, boots):
     draws = {}
-    for _ in range(n):
-        b = np.concatenate([rng.choice(pos, len(pos)), rng.choice(neg, len(neg))])
-        m = all_metrics(Y[b], S[b], T, labels)["overall"]
-        for k, v in m.items():
+    for b in boots:
+        for k, v in all_metrics(Y[b], S[b], T, labels)["overall"].items():
             draws.setdefault(k, []).append(v)
     return {k: [float(np.nanpercentile(v, 2.5)), float(np.nanpercentile(v, 97.5))]
             for k, v in draws.items() if k != "n_labels_auc"}
@@ -346,101 +478,130 @@ def clean(o):
     return o
 
 
-# ----------------------------------------------------------------------------- main loop
-def run(dataset, models, ratios, folds, device, n_boot):
+# ============================================================================ resume helpers
+def load_done(path, dataset, name):
+    """A (seed, size) counts as done only once its final 'test' record exists. Malformed lines and
+    records of interrupted sizes are dropped so a rerun can't double-count their folds."""
+    if not os.path.exists(path):
+        return set()
+    recs = []
+    for line in open(path):
+        try:
+            recs.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    key = lambda r: (r.get("seed", 0), round(r["ratio"], 4))
+    done = {key(r) for r in recs if r.get("scheme") == "test"}
+    keep = [r for r in recs if key(r) in done]
+    if len(keep) != len(recs):
+        print(f"[{dataset}] {name}: discarding {len(recs) - len(keep)} records from an interrupted run", flush=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.writelines(json.dumps(r) + "\n" for r in keep)
+        os.replace(tmp, path)
+    return done
+
+
+# ============================================================================ main loop
+def run_one(dataset, name, make, X, Y, labels, dev, test, seed, ratio, boots, out_dir, device, params):
+    n = max(int(round(ratio * len(dev))), 10)
+    sub = dev[:n]
+    Xs, Ys = X[sub], Y[sub]
+    strat = Ys[:, 0].astype(int)
+    recs, th_y, th_f = [], [], []
+    chosen_C = None
+    if name.partition("-")[0] in PER_SIZE_C:
+        chosen_C = select_C(dataset, name, device, SEED + seed, params, Xs, Ys)
+        if chosen_C is not None:
+            make = model_factory(dataset, name, device, SEED + seed, params, overrides={"C": chosen_C})
+    for k in FOLDS:
+        if np.bincount(strat, minlength=2).min() < k:
+            recs.append({"scheme": f"cv{k}", "fold": None, "skipped": "fewer positives than folds"})
+            continue
+        oof = np.full(Ys.shape, np.nan)
+        fold_ids = np.zeros(n, dtype=int)
+        for f, (tr, va) in enumerate(StratifiedKFold(k, shuffle=True, random_state=SEED + seed).split(Xs, strat)):
+            oof[va] = make().fit(Xs[tr], Ys[tr]).score(Xs[va])
+            fold_ids[va] = f
+        Ty, Tf = thresholds(Ys, oof, "youden"), thresholds(Ys, oof, "f1")
+        th_y.append(Ty); th_f.append(Tf)
+        for f in range(k):
+            m = fold_ids == f
+            # fold threshold from the OTHER folds' out-of-fold predictions (no peeking at fold f)
+            Tyf, Tff = thresholds(Ys[~m], oof[~m], "youden"), thresholds(Ys[~m], oof[~m], "f1")
+            recs.append({"scheme": f"cv{k}", "fold": f, "threshold": Tyf.tolist(),
+                         **all_metrics(Ys[m], oof[m], Tyf, labels),
+                         "overall_f1thr": all_metrics(Ys[m], oof[m], Tff, labels)["overall"]})
+        recs.append({"scheme": f"cv{k}", "fold": "pooled_oof", "threshold": Ty.tolist(),
+                     **all_metrics(Ys, oof, Ty, labels)})
+
+    model = make().fit(Xs, Ys)
+    S = model.score(X[test])
+    mean_t = lambda L: np.where(np.isnan(m := (np.nanmean(np.vstack(L), 0) if L else np.full(len(labels), np.nan))),
+                                0.5, m)
+    Ty, Tf = mean_t(th_y), mean_t(th_f)
+    test_m = all_metrics(Y[test], S, Ty, labels)
+    rec = {"scheme": "test", "fold": None, "threshold": Ty.tolist(), "threshold_f1": Tf.tolist(), **test_m,
+           "overall_f1thr": all_metrics(Y[test], S, Tf, labels)["overall"],
+           "ci95": bootstrap_ci(Y[test], S, Ty, labels, boots),
+           "ci95_f1thr": bootstrap_ci(Y[test], S, Tf, labels, boots)}
+    if hasattr(model, "k"):
+        rec["knn_k"] = int(model.k)
+    if chosen_C is not None:
+        rec["C"] = chosen_C
+    recs.append(rec)
+    np.savez_compressed(os.path.join(out_dir, "scores", f"{name}_s{seed}_r{int(round(ratio * 100)):03d}.npz"),
+                        y=Y[test], s=S, t=Ty, t_f1=Tf)
+    return n, int(strat.sum()), recs, test_m["overall"]
+
+
+def run(dataset, models, ratios, seeds, repeat_max_ratio, device, n_boot):
     X, Y, labels, info = load_dataset(dataset)
-    dev, test = make_splits(Y)
+    params = load_params(dataset)
     out_dir = os.path.join(ROOT, "results", dataset)
     os.makedirs(os.path.join(out_dir, "scores"), exist_ok=True)
+    _, test = make_splits(Y)
+    boots = bootstrap_indices(Y[test], n_boot)
     with open(os.path.join(out_dir, "split_info.json"), "w") as f:
-        json.dump(clean({**info, "n_dev": len(dev), "n_test": len(test),
-                         "test_pos_rate": Y[test].mean(0).tolist(), "labels": labels,
-                         "dev_order_sha1": hashlib.sha1(dev.tobytes()).hexdigest()}), f, indent=1)
+        json.dump(clean({**info, "n_dev": len(Y) - len(test), "n_test": len(test), "labels": labels,
+                         "test_pos_rate": Y[test].mean(0).tolist(), "seeds": seeds,
+                         "repeat_max_ratio": repeat_max_ratio,
+                         "test_idx_sha1": hashlib.sha1(np.sort(test).tobytes()).hexdigest()}), f, indent=1)
     np.save(os.path.join(out_dir, "test_idx.npy"), test)
-    np.save(os.path.join(out_dir, "dev_order.npy"), dev)
-    print(f"[{dataset}] {info} | dev={len(dev)} test={len(test)}", flush=True)
+    print(f"[{dataset}] {info} | test={len(test)} | tuned params: {'yes' if params else 'NO'}", flush=True)
 
-    for name in models:
-        path = os.path.join(out_dir, f"{name}.jsonl")
-        done = set()
-        if os.path.exists(path):
-            # A size counts as done only once its final 'test' record exists. Drop malformed lines and
-            # records of sizes that were interrupted mid-run, so a rerun can't double-count their folds.
-            recs_ok = []
-            for line in open(path):
-                try:
-                    recs_ok.append(json.loads(line))
-                except json.JSONDecodeError:
+    for seed in seeds:
+        dev, _ = make_splits(Y, order_seed=SEED + seed)
+        for name in models:
+            path = os.path.join(out_dir, f"{name}.jsonl")
+            done = load_done(path, dataset, name)
+            make = model_factory(dataset, name, device, seed=SEED + seed, params=params)
+            for ratio in ratios:
+                if seed != seeds[0] and ratio > repeat_max_ratio + 1e-9:
+                    continue  # extra seeds only where subset choice matters (small sizes)
+                if (seed, round(ratio, 4)) in done:
                     continue
-            done = {round(r["ratio"], 4) for r in recs_ok if r.get("scheme") == "test"}
-            keep = [r for r in recs_ok if round(r["ratio"], 4) in done]
-            if len(keep) != len(recs_ok):
-                print(f"[{dataset}] {name}: discarding {len(recs_ok) - len(keep)} records from an interrupted run",
-                      flush=True)
-                tmp = path + ".tmp"
-                with open(tmp, "w") as fh:
-                    fh.writelines(json.dumps(r) + "\n" for r in keep)
-                os.replace(tmp, path)
-        make = model_factory(dataset, name, device)
-        for ratio in ratios:
-            if round(ratio, 4) in done:
-                continue
-            n = max(int(round(ratio * len(dev))), 10)
-            sub = dev[:n]
-            Xs, Ys = X[sub], Y[sub]
-            strat = Ys[:, 0].astype(int)
-            t0 = time.time()
-            recs, thresholds = [], []
-            for k in folds:
-                if np.bincount(strat, minlength=2).min() < k:
-                    recs.append({"scheme": f"cv{k}", "fold": None, "skipped": "fewer positives than folds"})
-                    continue
-                oof = np.full(Ys.shape, np.nan)
-                fold_ids = np.zeros(n, dtype=int)
-                for f, (tr, va) in enumerate(StratifiedKFold(k, shuffle=True, random_state=SEED).split(Xs, strat)):
-                    oof[va] = make().fit(Xs[tr], Ys[tr]).score(Xs[va])
-                    fold_ids[va] = f
-                T = np.array([youden(Ys[:, j], oof[:, j]) for j in range(Ys.shape[1])])
-                thresholds.append(T)
-                for f in range(k):
-                    m = fold_ids == f
-                    recs.append({"scheme": f"cv{k}", "fold": f, "threshold": T.tolist(),
-                                 **all_metrics(Ys[m], oof[m], T, labels)})
-                recs.append({"scheme": f"cv{k}", "fold": "pooled_oof", "threshold": T.tolist(),
-                             **all_metrics(Ys, oof, T, labels)})
-            model = make().fit(Xs, Ys)
-            S = model.score(X[test])
-            T = np.nanmean(np.vstack(thresholds), 0) if thresholds else np.full(len(labels), 0.5)
-            T = np.where(np.isnan(T), 0.5, T)
-            test_m = all_metrics(Y[test], S, T, labels)
-            recs.append({"scheme": "test", "fold": None, "threshold": T.tolist(), **test_m,
-                         "ci95": bootstrap_ci(Y[test], S, T, labels, n=n_boot)})
-            np.savez_compressed(os.path.join(out_dir, "scores", f"{name}_r{int(round(ratio * 100)):03d}.npz"),
-                                y=Y[test], s=S, t=T)
-            block = "".join(json.dumps(clean({"dataset": dataset, "model": name, "ratio": ratio,
-                                              "n_train": n, "n_pos_train": int(strat.sum()), **r})) + "\n"
-                            for r in recs)
-            with open(path, "a") as fh:  # one write per finished size, flushed to disk
-                fh.write(block)
-                fh.flush()
-                os.fsync(fh.fileno())
-            o = test_m["overall"]
-            print(f"[{dataset}] {name:5s} {ratio*100:5.1f}% n={n:5d} test AUC={o.get('auc', float('nan')):.3f} "
-                  f"AP={o.get('ap', float('nan')):.3f} F1={o.get('f1', float('nan')):.3f} "
-                  f"({time.time() - t0:.0f}s)", flush=True)
+                t0 = time.time()
+                n, npos, recs, o = run_one(dataset, name, make, X, Y, labels, dev, test, seed, ratio, boots, out_dir,
+                                         device, params)
+                block = "".join(json.dumps(clean({"dataset": dataset, "model": name, "seed": seed, "ratio": ratio,
+                                                  "n_train": n, "n_pos_train": npos, **r})) + "\n" for r in recs)
+                with open(path, "a") as fh:  # one flushed write per finished (seed, size)
+                    fh.write(block); fh.flush(); os.fsync(fh.fileno())
+                print(f"[{dataset}] seed{seed} {name:10s} {ratio*100:5.1f}% n={n:5d} test AUC={o.get('auc', np.nan):.3f} "
+                      f"AP={o.get('ap', np.nan):.3f} F1={o.get('f1', np.nan):.3f} ({time.time() - t0:.0f}s)", flush=True)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=["ich", "sino"], required=True)
-    ap.add_argument("--models", nargs="+", required=True)
+    ap.add_argument("--models", nargs="+", default=None, help="default: all models for the dataset")
     ap.add_argument("--ratios", nargs="+", type=float, default=RATIOS)
-    ap.add_argument("--folds", nargs="+", type=int, default=FOLDS)
+    ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4],
+                    help="nested-subset orderings; seed 0 runs every size, others only up to --repeat-max-ratio")
+    ap.add_argument("--repeat-max-ratio", type=float, default=0.10)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--n-boot", type=int, default=1000)
-    ap.add_argument("--threads", type=int, default=0)
     a = ap.parse_args()
-    if a.threads:
-        import torch
-        torch.set_num_threads(a.threads)
-    run(a.dataset, a.models, sorted(a.ratios), a.folds, a.device, a.n_boot)
+    run(a.dataset, a.models or DEFAULT_MODELS[a.dataset], sorted(a.ratios), a.seeds, a.repeat_max_ratio,
+        a.device, a.n_boot)
