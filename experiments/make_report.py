@@ -45,7 +45,7 @@ plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.rig
 
 def nice(ds, m):
     base, _, loss = m.partition("-")
-    names = {"LR": "Logistic regression", "SVM": "Linear SVM" if ds == "ich" else "RBF SVM", "KNN": "k-NN (cosine)",
+    names = {"LR": "Logistic regression", "SVM": "Linear SVM" if ds.startswith("ich") else "RBF SVM", "KNN": "k-NN (cosine)",
              "RF": "Random forest", "XGB": "XGBoost", "MLP": "MLP (tuned)",
              "MLP3": "MLP 3-layer (legacy)", "MLP5": "MLP 5-layer (legacy)", "MLP7": "MLP 7-layer (legacy)"}
     lossname = {"focal": "focal loss", "bce": "plain BCE", "wbce": "weighted BCE"}
@@ -319,5 +319,5 @@ def main(ds):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("--dataset", choices=["ich", "sino"], required=True)
+    ap = argparse.ArgumentParser(); ap.add_argument("--dataset", choices=["ich", "ich_study", "sino"], required=True)
     main(ap.parse_args().dataset)

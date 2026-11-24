@@ -77,6 +77,21 @@ SinoCT (balanced classes).
 - **Metrics.** ROC AUC, PR AUC (AP), prevalence-normalized PR skill = (AP - prevalence)/(1 - prevalence),
   accuracy, sensitivity, specificity, precision, F1. ICH metrics are macro averages over the six labels.
 
+## ICH label check (`ich_study` sensitivity variant)
+
+`data/rsna_ich_id_map.csv` maps every ICH embedding row to its RSNA patient, built from the old
+`file_list.txt` (control), the conversion logs (`nii_report*.ftr`) and RSNA slice metadata (`data.ftr`).
+Check: for all 16,124 mappable rows the CSV labels equal RSNA's patient-level labels exactly.
+
+- Each volume is one RSNA **patient** (no patient appears twice, none in both groups).
+- 1,460 rows are patients with >1 CT study. The converter kept **one** study (never stacked), but the label
+  is the patient-level maximum over all studies. Where the kept study is identifiable: 81 rows are labelled
+  hemorrhage although the kept study has none, and 274 rows have at least one wrong subtype label.
+  352 multi-study rows can't be resolved.
+- `--dataset ich_study` uses the kept study's own labels and drops the unresolved rows (15,709 rows).
+  Run it as a sensitivity analysis; reuse the ICH hyperparameters with
+  `copy results\ich\tuned_params.json results\ich_study\` before `scaling_cv.py --dataset ich_study`.
+
 ## What changed vs. the deck's experiments (numbers will not match exactly)
 
 1. De-duplicated data and a new stratified test split (not the old `train_test_split(random_state=42)`).

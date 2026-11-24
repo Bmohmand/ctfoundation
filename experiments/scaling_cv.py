@@ -41,6 +41,7 @@ DEFAULT_MODELS = {
     "ich": ["LR", "SVM", "KNN", "RF", "XGB", "MLP", "MLP-focal", "MLP5", "MLP7"],
     "sino": ["LR", "SVM", "KNN", "RF", "XGB", "MLP", "MLP-focal", "MLP3", "MLP5"],
 }
+DEFAULT_MODELS["ich_study"] = DEFAULT_MODELS["ich"]
 
 
 # ============================================================================ data
@@ -57,7 +58,7 @@ def load_dataset(name):
             return d["X"], d["Y"], list(d["labels"]), info
 
     info = {"version": 3}
-    if name == "ich":
+    if name in ("ich", "ich_study"):
         df = pd.concat([pd.read_csv(os.path.join(ROOT, "Rsna_ICH_Hemm.csv")),
                         pd.read_csv(os.path.join(ROOT, "Rsna_ICH_Control.csv"))], ignore_index=True)
         info["rows_raw"] = len(df)
@@ -68,6 +69,18 @@ def load_dataset(name):
         info["conflicting_dup_groups_dropped"] = int(conflict.sum())
         df = df[~df["h"].isin(conflict[conflict].index)].drop_duplicates("h")
         labels = ICH_LABELS
+        if name == "ich_study":
+            # Sensitivity variant: each RSNA volume is ONE study of the patient, but the CSV labels are
+            # patient-level (max over all of the patient's studies). Use the labels of the study that was
+            # actually converted (data/rsna_ich_id_map.csv, built from data.ftr + nii_report), and drop
+            # multi-study rows whose converted study can't be identified.
+            m = pd.read_csv(os.path.join(ROOT, "data", "rsna_ich_id_map.csv"))
+            m = m[m["study_any"].notna()].set_index("url")
+            info["ich_study_rows_dropped"] = int((~df["url"].isin(m.index)).sum())
+            df = df[df["url"].isin(m.index)].copy()
+            for k in labels:
+                df[k] = m.loc[df["url"], f"study_{k}"].values
+            info["label_source"] = "study-level (converted study)"
         Y = df[labels].values.astype(np.float32)
     elif name == "sino":
         df = pd.read_csv(os.path.join(ROOT, "Sino_CT.csv"))
@@ -359,13 +372,14 @@ def model_factory(dataset, name, device, seed=SEED, params=None, overrides=None)
     if base in need_tuned and not (params and base in params):
         raise SystemExit(f"No tuned parameters for {base}. Run: python experiments/tune.py --dataset {dataset}")
     P = {**(params.get(base, {}) if params else {}), **(overrides or {})}
-    default_loss = "wbce" if dataset == "ich" else "bce"
+    is_ich = dataset.startswith("ich")
+    default_loss = "wbce" if is_ich else "bce"
     loss = loss or default_loss
 
     if base == "LR":
         return lambda: PerLabel(lambda y: LogisticRegression(max_iter=3000, **P))
     if base == "SVM":
-        if dataset == "ich":  # linear SVM as in the deck (RBF is O(n^2) on 13k scans x 6 labels)
+        if is_ich:  # linear SVM as in the deck (RBF is O(n^2) on 13k scans x 6 labels)
             return lambda: PerLabel(lambda y: LinearSVC(dual=False, max_iter=5000, **P))
         return lambda: PerLabel(lambda y: SVC(kernel="rbf", random_state=seed, **P))
     if base == "KNN":
@@ -379,9 +393,9 @@ def model_factory(dataset, name, device, seed=SEED, params=None, overrides=None)
         return lambda: TorchMLP(P["hidden"], P["dropout"], P["lr"], loss=loss, device=device, seed=seed)
 
     # ---- legacy MLPs, exactly as in the deck (for continuity; see README caveats) ----
-    if dataset == "ich" and base == "MLP5":  # MLP.ipynb: 1408 -> 128 -> 64 -> 6
+    if is_ich and base == "MLP5":  # MLP.ipynb: 1408 -> 128 -> 64 -> 6
         return lambda: TorchMLP([128, 64], [0.5, 0.5], 1e-3, loss=loss, device=device, seed=seed)
-    if dataset == "ich" and base == "MLP7":  # Optuna architecture in model_hyperparameters.json
+    if is_ich and base == "MLP7":  # Optuna architecture in model_hyperparameters.json
         return lambda: TorchMLP([807, 467, 258, 180, 126, 85, 43],
                                 [0.192, 0.252, 0.398, 0.441, 0.411, 0.411, 0.175],
                                 1.8774581889e-4, loss=loss, device=device, seed=seed)
@@ -595,7 +609,7 @@ def run(dataset, models, ratios, seeds, repeat_max_ratio, device, n_boot):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", choices=["ich", "sino"], required=True)
+    ap.add_argument("--dataset", choices=["ich", "ich_study", "sino"], required=True)
     ap.add_argument("--models", nargs="+", default=None, help="default: all models for the dataset")
     ap.add_argument("--ratios", nargs="+", type=float, default=RATIOS)
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4],

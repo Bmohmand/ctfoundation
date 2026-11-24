@@ -47,7 +47,7 @@ def grids(dataset, device):
                 {"learning_rate": [0.01, 0.1, 0.2], "max_depth": [3, 6, 10], "n_estimators": [100, 200, 300],
                  "subsample": [0.8, 1.0], "scale_pos_weight": [1, 5, 10]}),
     }
-    if dataset == "ich":
+    if dataset.startswith("ich"):
         g["SVM"] = (LinearSVC(dual=False, max_iter=5000),
                     {"C": [1e-4, 1e-3, 1e-2, 1e-1, 1], "class_weight": ["balanced", None]})
     else:
@@ -74,7 +74,7 @@ def tune_mlp(dataset, X, Y, device, n_trials):
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     strat = Y[:, 0].astype(int)
     tr, va = train_test_split(np.arange(len(X)), test_size=0.15, stratify=strat, random_state=S.SEED)
-    loss = "wbce" if dataset == "ich" else "bce"
+    loss = "wbce" if dataset.startswith("ich") else "bce"
 
     def objective(trial):
         n_layers = trial.suggest_int("n_layers", 3, 7)
@@ -109,7 +109,7 @@ def tune_mlp(dataset, X, Y, device, n_trials):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", choices=["ich", "sino"], required=True)
+    ap.add_argument("--dataset", choices=["ich", "ich_study", "sino"], required=True)
     ap.add_argument("--models", nargs="+", default=["LR", "SVM", "RF", "XGB", "MLP"])
     ap.add_argument("--n-iter", type=int, default=20, help="random-search draws per sklearn model")
     ap.add_argument("--n-trials", type=int, default=50, help="Optuna trials for the MLP")
