@@ -116,6 +116,7 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--force", action="store_true", help="retune models that already have saved params")
     a = ap.parse_args()
+    S.keep_awake()
 
     X, Y, labels, info = S.load_dataset(a.dataset)
     dev, test = S.make_splits(Y)

@@ -527,6 +527,19 @@ def load_done(path, dataset, name):
     return done
 
 
+def keep_awake():
+    """On Windows, ask the OS not to sleep while this process runs (no admin needed; released
+    automatically when the process exits). The display may still turn off."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+            print("[keep-awake] Windows sleep blocked while this run is active", flush=True)
+        except Exception as e:  # never fail a run over this
+            print(f"[keep-awake] could not block sleep: {e}", flush=True)
+
+
 # ============================================================================ main loop
 def run_one(dataset, name, make, X, Y, labels, dev, test, seed, ratio, boots, out_dir, device, params):
     n = max(int(round(ratio * len(dev))), 10)
@@ -628,5 +641,6 @@ if __name__ == "__main__":
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--n-boot", type=int, default=1000)
     a = ap.parse_args()
+    keep_awake()
     run(a.dataset, a.models or DEFAULT_MODELS[a.dataset], sorted(a.ratios), a.seeds, a.repeat_max_ratio,
         a.device, a.n_boot)
