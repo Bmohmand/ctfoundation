@@ -29,7 +29,7 @@ Useful flags: `--models LR KNN MLP-focal` (subset of models), `--ratios 0.01 0.0
 | Name | What it is |
 |---|---|
 | `LR` | Logistic regression (linear probe). C re-selected on each training subset |
-| `SVM` | ICH: linear SVM; SinoCT: RBF SVM (as in the deck). C re-selected on each training subset |
+| `SVM` | ICH: linear SVM; SinoCT: RBF SVM (as in the deck). C re-selected on each training subset; Platt-calibrated (3-fold sigmoid) so thresholds transfer from CV to the final model |
 | `KNN` | Cosine k-NN, distance-weighted; k re-selected inside every fit (3-fold CV) |
 | `RF`, `XGB` | Random forest, XGBoost (grids from `NewICHModels.py`) |
 | `MLP` | MLP with architecture/lr from a fresh Optuna search on the dev pool (same search space as `MLP_Optimized.ipynb`) |

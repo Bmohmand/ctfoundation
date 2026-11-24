@@ -24,6 +24,7 @@ import time
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
@@ -352,7 +353,7 @@ def select_C(dataset, name, device, seed, params, X, Y):
     folds = list(StratifiedKFold(3, shuffle=True, random_state=seed).split(X, y0))
     stats = []
     for C in grid:  # ascending C = decreasing regularization
-        make = model_factory(dataset, name, device, seed, params, overrides={"C": C})
+        make = model_factory(dataset, name, device, seed, params, overrides={"C": C, "_calibrate": False})
         aucs = []
         for tr, va in folds:
             if y0[va].min() == y0[va].max():
@@ -372,6 +373,7 @@ def model_factory(dataset, name, device, seed=SEED, params=None, overrides=None)
     if base in need_tuned and not (params and base in params):
         raise SystemExit(f"No tuned parameters for {base}. Run: python experiments/tune.py --dataset {dataset}")
     P = {**(params.get(base, {}) if params else {}), **(overrides or {})}
+    calibrate = P.pop("_calibrate", True)
     is_ich = dataset.startswith("ich")
     default_loss = "wbce" if is_ich else "bce"
     loss = loss or default_loss
@@ -379,9 +381,17 @@ def model_factory(dataset, name, device, seed=SEED, params=None, overrides=None)
     if base == "LR":
         return lambda: PerLabel(lambda y: LogisticRegression(max_iter=3000, **P))
     if base == "SVM":
-        if is_ich:  # linear SVM as in the deck (RBF is O(n^2) on 13k scans x 6 labels)
-            return lambda: PerLabel(lambda y: LinearSVC(dual=False, max_iter=5000, **P))
-        return lambda: PerLabel(lambda y: SVC(kernel="rbf", random_state=seed, **P))
+        # SVM decision values change scale between the CV-fold models (where the threshold is chosen) and
+        # the final model, so a threshold picked on one doesn't transfer. Platt-calibrate (3-fold sigmoid)
+        # to get probabilities on a common scale. Calibration is monotone within a model, so AUC barely moves.
+        def svm(y):
+            base_est = (LinearSVC(dual=False, max_iter=5000, **P) if is_ich  # linear for ICH as in the deck
+                        else SVC(kernel="rbf", random_state=seed, **P))
+            n_min = int(np.bincount(y, minlength=2).min())
+            if not calibrate or n_min < 3:
+                return base_est
+            return CalibratedClassifierCV(base_est, method="sigmoid", cv=3)
+        return lambda: PerLabel(svm)
     if base == "KNN":
         return lambda: InnerCVKNN(seed=seed)
     if base == "RF":
