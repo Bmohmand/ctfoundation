@@ -1,2 +1,5 @@
 “*.csv” filter=lfs diff=lfs merge=lfs -text
 *.csv filter=lfs diff=lfs merge=lfs -text
+
+# small derived tables: keep in plain git, not LFS
+data/*.csv !filter !diff !merge text
