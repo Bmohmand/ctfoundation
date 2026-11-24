@@ -44,8 +44,9 @@ SinoCT (balanced classes).
 - **De-duplication.** SinoCT: 100 rows repeat an earlier URL (rows 5700-5799 again as 5800-5899) -> dropped
   (6,830 -> 6,730). ICH: exact-duplicate embeddings dropped; 32 embeddings present in both the hemorrhage and
   control files with conflicting labels are removed entirely (16,125 -> 16,058).
-- **SinoCT label.** Positive class = **abnormal** (`"0,1"`). The old `NewSinoCTModels.py` used normal as the
-  positive class, so its sensitivity/specificity/F1/AP describe detecting *normal* scans.
+- **SinoCT label.** Positive class = `"1,0"` (abnormal), the same mapping as `NewSinoCTModels.py`. An old
+  comment in `OIdSinoCTModels/sino_ct_model.ipynb` called `"1,0"` normal; worth confirming once against the
+  AIMI label file, since sensitivity/specificity/F1/AP depend on the direction (AUC does not).
 - **Test set.** One stratified 20% hold-out (`random_state=42`; stratified on `any` / `abnormal`). Never used
   for training, tuning, early stopping, model selection or thresholds.
 - **Nested training subsets.** For each seed the development pool is ordered once (stratified, so each prefix
@@ -79,7 +80,7 @@ SinoCT (balanced classes).
 ## What changed vs. the deck's experiments (numbers will not match exactly)
 
 1. De-duplicated data and a new stratified test split (not the old `train_test_split(random_state=42)`).
-2. SinoCT positive class flipped to abnormal.
+2. (SinoCT positive class unchanged: `"1,0"`.)
 3. All hyperparameters retuned on the development pool; LR/SVM C and k-NN k re-selected per training size.
 4. AUC from continuous scores everywhere (the SinoCT notebooks computed AUC from hard 0/1 predictions).
 5. Thresholds chosen on out-of-fold predictions instead of a fixed 0.5.

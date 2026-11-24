@@ -53,10 +53,10 @@ def load_dataset(name):
     if os.path.exists(cache):
         d = np.load(cache, allow_pickle=True)
         info = dict(json.loads(str(d["info"])))
-        if info.get("version") == 2:
+        if info.get("version") == 3:
             return d["X"], d["Y"], list(d["labels"]), info
 
-    info = {"version": 2}
+    info = {"version": 3}
     if name == "ich":
         df = pd.concat([pd.read_csv(os.path.join(ROOT, "Rsna_ICH_Hemm.csv")),
                         pd.read_csv(os.path.join(ROOT, "Rsna_ICH_Control.csv"))], ignore_index=True)
@@ -75,10 +75,11 @@ def load_dataset(name):
         info["dup_url_rows_dropped"] = int(df.duplicated("url").sum())
         df = df.drop_duplicates("url")
         labels = ["abnormal"]
-        # one-hot [normal, abnormal]: "1,0" = normal, "0,1" = abnormal (see OIdSinoCTModels notebooks).
-        # Positive class = ABNORMAL. NewSinoCTModels.py used normal as positive.
-        Y = (df["label"] == "0,1").values.astype(np.float32)[:, None]
-        info["positive_class"] = "abnormal ('0,1')"
+        # Positive class = "1,0", the same mapping as NewSinoCTModels.py (confirmed by Bahram as the
+        # abnormal class; consistent with SinoCT being ~55% abnormal and "1,0" being the larger class).
+        # Note: an old comment in OIdSinoCTModels/sino_ct_model.ipynb called "1,0" normal.
+        Y = (df["label"] == "1,0").values.astype(np.float32)[:, None]
+        info["positive_class"] = "abnormal ('1,0')"
     else:
         raise ValueError(name)
 
