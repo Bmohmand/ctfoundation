@@ -5,7 +5,7 @@ Three scripts, run in order. Every step is resumable: rerun the same command aft
 ```bat
 :: Windows (researchenv); use plain `python` if the env is activated
 set PY=C:\Users\bahra\anaconda3\envs\researchenv\python.exe
-%PY% -m pip install numpy pandas scikit-learn xgboost matplotlib optuna
+%PY% -m pip install "numpy<2.5" pandas pyarrow scipy scikit-learn xgboost matplotlib optuna
 git lfs pull
 
 :: 1) tune hyperparameters on the development pool only (test set untouched)
