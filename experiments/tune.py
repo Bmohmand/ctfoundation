@@ -125,7 +125,7 @@ def main():
 
     out = os.path.join(S.ROOT, "results", a.dataset, "tuned_params.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    res = json.load(open(out)) if os.path.exists(out) else {"best": {}, "score": {}}
+    res = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else {"best": {}, "score": {}}
     g = grids(a.dataset, a.device)
     for m in a.models:
         if m in res["best"] and not a.force:
@@ -139,7 +139,7 @@ def main():
         res["tuned_on"] = {"dataset": a.dataset, "n_dev": len(dev), "target": labels[0],
                            "note": "dev pool only; test set never used"}
         tmp = out + ".tmp"
-        json.dump(res, open(tmp, "w"), indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+        json.dump(res, open(tmp, "w", encoding="utf-8"), indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))
         os.replace(tmp, out)  # saved after every model, so an interrupted run keeps finished models
     print("saved", out)
 

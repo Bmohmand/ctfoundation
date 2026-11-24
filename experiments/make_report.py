@@ -67,7 +67,7 @@ def style(m, i):
 def load(ds):
     rows = []
     for p in glob.glob(os.path.join(ROOT, "results", ds, "*.jsonl")):
-        for line in open(p):
+        for line in open(p, encoding="utf-8"):
             try:
                 r = json.loads(line)
             except json.JSONDecodeError:
@@ -90,8 +90,8 @@ def to_md(df):
 
 def save(df, rep, name, note=""):
     df = df.astype(object).where(df.notna(), "–")
-    df.to_csv(os.path.join(rep, f"{name}.csv"), index=False)
-    with open(os.path.join(rep, f"{name}.md"), "w") as f:
+    df.to_csv(os.path.join(rep, f"{name}.csv"), index=False, encoding="utf-8-sig")  # utf-8-sig: Excel-friendly
+    with open(os.path.join(rep, f"{name}.md"), "w", encoding="utf-8") as f:
         f.write(note + ("\n\n" if note else "") + to_md(df))
 
 
@@ -148,7 +148,7 @@ def main(ds):
     models = order({r["model"] for r in rows})
     test = [r for r in rows if r["scheme"] == "test"]
     test0 = [r for r in test if r["seed"] == 0]
-    info = json.load(open(os.path.join(ROOT, "results", ds, "split_info.json")))
+    info = json.load(open(os.path.join(ROOT, "results", ds, "split_info.json"), encoding="utf-8"))
     labels = info["labels"]
     multi = len(labels) > 1
 

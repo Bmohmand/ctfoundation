@@ -510,7 +510,7 @@ def load_done(path, dataset, name):
     if not os.path.exists(path):
         return set()
     recs = []
-    for line in open(path):
+    for line in open(path, encoding="utf-8"):
         try:
             recs.append(json.loads(line))
         except json.JSONDecodeError:
@@ -521,7 +521,7 @@ def load_done(path, dataset, name):
     if len(keep) != len(recs):
         print(f"[{dataset}] {name}: discarding {len(recs) - len(keep)} records from an interrupted run", flush=True)
         tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             fh.writelines(json.dumps(r) + "\n" for r in keep)
         os.replace(tmp, path)
     return done
@@ -600,7 +600,7 @@ def run(dataset, models, ratios, seeds, repeat_max_ratio, device, n_boot):
     os.makedirs(os.path.join(out_dir, "scores"), exist_ok=True)
     _, test = make_splits(Y)
     boots = bootstrap_indices(Y[test], n_boot)
-    with open(os.path.join(out_dir, "split_info.json"), "w") as f:
+    with open(os.path.join(out_dir, "split_info.json"), "w", encoding="utf-8") as f:
         json.dump(clean({**info, "n_dev": len(Y) - len(test), "n_test": len(test), "labels": labels,
                          "test_pos_rate": Y[test].mean(0).tolist(), "seeds": seeds,
                          "repeat_max_ratio": repeat_max_ratio,
@@ -624,7 +624,7 @@ def run(dataset, models, ratios, seeds, repeat_max_ratio, device, n_boot):
                                          device, params)
                 block = "".join(json.dumps(clean({"dataset": dataset, "model": name, "seed": seed, "ratio": ratio,
                                                   "n_train": n, "n_pos_train": npos, **r})) + "\n" for r in recs)
-                with open(path, "a") as fh:  # one flushed write per finished (seed, size)
+                with open(path, "a", encoding="utf-8") as fh:  # one flushed write per finished (seed, size)
                     fh.write(block); fh.flush(); os.fsync(fh.fileno())
                 print(f"[{dataset}] seed{seed} {name:10s} {ratio*100:5.1f}% n={n:5d} test AUC={o.get('auc', np.nan):.3f} "
                       f"AP={o.get('ap', np.nan):.3f} F1={o.get('f1', np.nan):.3f} ({time.time() - t0:.0f}s)", flush=True)
