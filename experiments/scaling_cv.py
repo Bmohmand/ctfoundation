@@ -25,6 +25,8 @@ import warnings
 
 import numpy as np
 import pandas as pd
+from scipy.linalg import LinAlgWarning, cho_factor, cho_solve
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -32,11 +34,12 @@ from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC, LinearSVC
+from sklearn.svm import SVC
 
 from sklearn.exceptions import ConvergenceWarning
 
-# Weakly regularized fits that hit max_iter only cost time; they never win the 1-SE C selection.
+# Convergence warnings are not printed (thousands per run) but are counted per fit in fit_score_many and
+# stored as "n_not_converged" in every test record, so an unconverged result is visible in the jsonl/report.
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -296,6 +299,71 @@ class PerLabel:
         return np.column_stack(out)
 
 
+class NewtonLinearSVC(ClassifierMixin, BaseEstimator):
+    """Same model as sklearn's LinearSVC(dual=False) -- L2-regularized squared hinge, intercept as a
+    regularized constant feature (intercept_scaling=1), optional class_weight -- solved exactly by
+    Newton's method with the generalized Hessian (Keerthi & DeCoste 2005). The objective is strongly
+    convex, so the optimum is unique and any correct solver lands on it; this one does a handful of
+    multithreaded d x d solves instead of liblinear's many single-threaded CG steps, which crawl at
+    large C (ICH, d=1408: one fit at C=1 on the full pool ~185 s in liblinear)."""
+
+    def __init__(self, C=1.0, class_weight=None, tol=1e-8, max_iter=200):
+        self.C, self.class_weight, self.tol, self.max_iter = C, class_weight, tol, max_iter
+
+    def _objective(self, w, A, c):
+        m = np.maximum(0.0, 1.0 - A @ w)
+        return 0.5 * w @ w + (c * m * m).sum()
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=np.float64)
+        self.classes_, yi = np.unique(y, return_inverse=True)
+        if len(self.classes_) != 2:
+            raise ValueError("NewtonLinearSVC is binary only")
+        s = np.where(yi == 1, 1.0, -1.0)
+        cw = np.ones(2)
+        if self.class_weight == "balanced":
+            cw = len(yi) / (2.0 * np.bincount(yi, minlength=2))
+        elif isinstance(self.class_weight, dict):
+            cw = np.array([self.class_weight.get(k, 1.0) for k in self.classes_], dtype=np.float64)
+        c = self.C * cw[yi]
+        A = np.hstack([X, np.ones((len(X), 1))]) * s[:, None]  # rows y_i * [x_i, 1]
+        w = np.zeros(A.shape[1])
+        f = self._objective(w, A, c)
+        g0 = None
+        self.n_iter_, self.converged_ = 0, False
+        for it in range(1, self.max_iter + 1):
+            m = 1.0 - A @ w
+            act = m > 0
+            Aa, ca = A[act], c[act]
+            g = w - 2.0 * Aa.T @ (ca * m[act])
+            gn = np.linalg.norm(g)
+            g0 = gn if g0 is None else g0
+            if gn <= self.tol * max(g0, 1.0):
+                self.n_iter_, self.converged_ = it - 1, True
+                break
+            H = (Aa.T * (2.0 * ca)) @ Aa
+            H[np.diag_indices_from(H)] += 1.0
+            d = -cho_solve(cho_factor(H), g)  # H = I + 2 A'CA is SPD; Cholesky is ~10x faster than LU here
+            t, slope = 1.0, g @ d  # Armijo backtracking (t=1 is accepted near the optimum)
+            while True:
+                w_new = w + t * d
+                f_new = self._objective(w_new, A, c)
+                if f_new <= f + 1e-4 * t * slope or t < 1e-10:
+                    break
+                t *= 0.5
+            w, f = w_new, f_new
+            self.n_iter_ = it
+        else:
+            self.converged_ = gn <= self.tol * max(g0, 1.0)
+        if not self.converged_:
+            warnings.warn(f"NewtonLinearSVC did not converge in {self.max_iter} iterations", ConvergenceWarning)
+        self.coef_, self.intercept_ = w[None, :-1].copy(), np.array([w[-1]])
+        return self
+
+    def decision_function(self, X):
+        return np.asarray(X, dtype=np.float64) @ self.coef_[0] + self.intercept_[0]
+
+
 class InnerCVKNN:
     """Cosine k-NN on standardized embeddings. k is re-selected at EVERY fit by 3-fold CV on the
     training data (AUC on the first label), so it adapts to the training-set size."""
@@ -344,11 +412,12 @@ def load_params(dataset):
     return json.load(open(p))["best"] if os.path.exists(p) else None
 
 
-C_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1, 10, 100)
+C_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1, 10, 100)  # linear SVM (squared hinge stays well-posed at large C)
+LR_C_MAX = 1.0  # see model_factory: LR beyond C=1 is numerically ill-determined on these embeddings
+LR_C_GRID = tuple(c for c in C_GRID if c <= LR_C_MAX)
 RBF_C_GRID = (0.1, 0.3, 1, 3, 10)
-# ICH linear SVM: at C >= 10 liblinear barely converges on 1,408 dims (one calibrated 6-label fit > 8 min at 20% of
-# the data, vs ~1.5 min at C=1), and for a hinge loss C >= 10 is effectively unregularized. LR keeps the full grid.
-ICH_SVM_C_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1)
+# ICH linear SVM uses the full C_GRID, like LR. (An earlier cap at C=1 worked around liblinear crawling at large C;
+# NewtonLinearSVC fits any C in ~5 s on the full pool, and the cap was binding: C=1 was picked at 2 of 6 sizes.)
 PER_SIZE_C = {"LR", "SVM"}  # regularization strength re-selected on each training subset
 
 
@@ -360,25 +429,66 @@ def select_C(dataset, name, device, seed, params, X, Y):
     if np.bincount(y0, minlength=2).min() < 3:
         return None
     base = name.partition("-")[0]
-    if base == "SVM" and dataset == "sino":
-        grid = RBF_C_GRID
-    elif base == "SVM" and dataset.startswith("ich"):
-        grid = ICH_SVM_C_GRID
-    else:
-        grid = C_GRID
-    folds = list(StratifiedKFold(3, shuffle=True, random_state=seed).split(X, y0))
+    grid = LR_C_GRID if base == "LR" else RBF_C_GRID if dataset == "sino" else C_GRID
+    folds = [(tr, va) for tr, va in StratifiedKFold(3, shuffle=True, random_state=seed).split(X, y0)
+             if y0[va].min() != y0[va].max()]
+    # only the first label is scored, so only fit that one (6x less work for ICH; same C chosen)
+    tasks = [(model_factory(dataset, name, device, seed, params, overrides={"C": C, "_calibrate": False}),
+              tr, va) for C in grid for tr, va in folds]
+    out, n_nc, _ = fit_score_many(X, Y[:, :1], tasks, n_workers(dataset, name, X, len(tasks)))
     stats = []
-    for C in grid:  # ascending C = decreasing regularization
-        make = model_factory(dataset, name, device, seed, params, overrides={"C": C, "_calibrate": False})
-        aucs = []
-        for tr, va in folds:
-            if y0[va].min() == y0[va].max():
-                continue
-            # only the first label is scored, so only fit that one (6x less work for ICH; same C chosen)
-            aucs.append(roc_auc_score(y0[va], make().fit(X[tr], Y[tr][:, :1]).score(X[va])[:, 0]))
+    for i, C in enumerate(grid):  # ascending C = decreasing regularization
+        aucs = [roc_auc_score(y0[va], s[:, 0]) for (_, _, va), s in zip(tasks[i * len(folds):(i + 1) * len(folds)],
+                                                                         out[i * len(folds):(i + 1) * len(folds)])]
         stats.append((C, np.mean(aucs), np.std(aucs, ddof=1) / np.sqrt(len(aucs)) if len(aucs) > 1 else 0.0))
     best = max(stats, key=lambda t: t[1])
-    return next(C for C, mu, _ in stats if mu >= best[1] - best[2])
+    return next(C for C, mu, _ in stats if mu >= best[1] - best[2]), n_nc
+
+
+# ============================================================================ parallel fits
+# Independent fits (C-search folds, CV folds, the final model) are run side by side for the one model whose
+# solver is single-threaded: libsvm's RBF SVC (SinoCT). libsvm is deterministic, so results do not depend on
+# the number of workers. GPU models and models that already use every core (RF, XGB, LR's newton-cholesky and
+# NewtonLinearSVC, both multithreaded BLAS) stay sequential.
+def _parallel_ok(dataset, name):
+    return name.partition("-")[0] == "SVM" and not dataset.startswith("ich")
+
+
+def n_workers(dataset, name, X, n_tasks):
+    if not _parallel_ok(dataset, name) or n_tasks < 2:
+        return 1
+    if os.environ.get("CT_JOBS"):
+        return max(1, min(int(os.environ["CT_JOBS"]), n_tasks))
+    try:
+        import psutil
+        cores = psutil.cpu_count(logical=False) or os.cpu_count() or 1
+        avail = psutil.virtual_memory().available
+    except ImportError:
+        cores, avail = max(1, (os.cpu_count() or 2) // 2), 4e9
+    per_worker = 6 * X.nbytes + 300e6  # training slice + standardized copy + solver copies + interpreter
+    return int(max(1, min(cores, n_tasks, (0.7 * avail) // per_worker)))
+
+
+def _fit_score(make, X, Y, tr, X_eval):
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always", ConvergenceWarning)
+        warnings.simplefilter("always", LinAlgWarning)  # ill-conditioned Newton solves count as unconverged
+        model = make().fit(X[tr], Y[tr])
+        s = model.score(X_eval)
+    bad = sum(issubclass(x.category, (ConvergenceWarning, LinAlgWarning)) for x in w)
+    return s, bad, getattr(model, "k", None)
+
+
+def fit_score_many(X, Y, tasks, n_jobs):
+    """tasks: (make, train_idx, eval) with eval = row indices into X or an array of rows to score.
+    Returns (score arrays, number of convergence warnings raised during the fits, each model's k-NN k or None)."""
+    jobs = [(make, tr, X[ev] if np.ndim(ev) == 1 else ev) for make, tr, ev in tasks]
+    if n_jobs == 1:
+        res = [_fit_score(make, X, Y, tr, Xe) for make, tr, Xe in jobs]
+    else:
+        from joblib import Parallel, delayed
+        res = Parallel(n_jobs=n_jobs, backend="loky")(delayed(_fit_score)(make, X, Y, tr, Xe) for make, tr, Xe in jobs)
+    return [r[0] for r in res], sum(r[1] for r in res), [r[2] for r in res]
 
 
 def model_factory(dataset, name, device, seed=SEED, params=None, overrides=None):
@@ -396,14 +506,19 @@ def model_factory(dataset, name, device, seed=SEED, params=None, overrides=None)
     loss = loss or default_loss
 
     if base == "LR":
-        return lambda: PerLabel(lambda y: LogisticRegression(max_iter=3000, **P))
+        # Exact Newton solver, C capped at LR_C_MAX. On these embeddings (strongly collinear, rcond ~1e-9) LR at
+        # C >= 10 has no well-determined optimum: newton-cholesky fails to converge and lbfgs lands wherever it
+        # stops (ICH 20%: test AUC 0.897 vs 0.905 between solvers, and it changed with the BLAS thread count).
+        # At C <= 1 the solve converges in ~4 Newton steps (~1 s on the full ICH pool) and is reproducible.
+        P["C"] = min(P.get("C", 1.0), LR_C_MAX)
+        return lambda: PerLabel(lambda y: LogisticRegression(solver="newton-cholesky", max_iter=200, **P))
     if base == "SVM":
         # SVM decision values change scale between the CV-fold models (where the threshold is chosen) and
         # the final model, so a threshold picked on one doesn't transfer. Platt-calibrate (3-fold sigmoid)
         # to get probabilities on a common scale. Calibration is monotone within a model, so AUC barely moves.
         def svm(y):
-            base_est = (LinearSVC(dual=False, max_iter=5000, **P) if is_ich  # linear for ICH as in the deck
-                        else SVC(kernel="rbf", random_state=seed, **P))
+            # linear for ICH as in the deck; NewtonLinearSVC = LinearSVC(dual=False)'s model with an exact solver
+            base_est = (NewtonLinearSVC(**P) if is_ich else SVC(kernel="rbf", random_state=seed, **P))
             n_min = int(np.bincount(y, minlength=2).min())
             if not calibrate or n_min < 3:
                 return base_est
@@ -566,19 +681,27 @@ def run_one(dataset, name, make, X, Y, labels, dev, test, seed, ratio, boots, ou
     Xs, Ys = X[sub], Y[sub]
     strat = Ys[:, 0].astype(int)
     recs, th_y, th_f = [], [], []
-    chosen_C = None
+    chosen_C, n_nc_csearch = None, 0
     if name.partition("-")[0] in PER_SIZE_C:
-        chosen_C = select_C(dataset, name, device, SEED + seed, params, Xs, Ys)
-        if chosen_C is not None:
+        sel = select_C(dataset, name, device, SEED + seed, params, Xs, Ys)
+        if sel is not None:
+            chosen_C, n_nc_csearch = sel
             make = model_factory(dataset, name, device, SEED + seed, params, overrides={"C": chosen_C})
+    # every CV-fold fit and the final full-subset fit are independent: build them all, run them together
+    split = {k: list(StratifiedKFold(k, shuffle=True, random_state=SEED + seed).split(Xs, strat)) for k in FOLDS
+             if np.bincount(strat, minlength=2).min() >= k}
+    tasks = [(make, tr, va) for k in split for tr, va in split[k]] + [(make, np.arange(n), X[test])]
+    scores, n_nc, ks = fit_score_many(Xs, Ys, tasks, n_workers(dataset, name, Xs, len(tasks)))
+    final_k = ks[-1]
+    scores = iter(scores)
     for k in FOLDS:
-        if np.bincount(strat, minlength=2).min() < k:
+        if k not in split:
             recs.append({"scheme": f"cv{k}", "fold": None, "skipped": "fewer positives than folds"})
             continue
         oof = np.full(Ys.shape, np.nan)
         fold_ids = np.zeros(n, dtype=int)
-        for f, (tr, va) in enumerate(StratifiedKFold(k, shuffle=True, random_state=SEED + seed).split(Xs, strat)):
-            oof[va] = make().fit(Xs[tr], Ys[tr]).score(Xs[va])
+        for f, (tr, va) in enumerate(split[k]):
+            oof[va] = next(scores)
             fold_ids[va] = f
         Ty, Tf = thresholds(Ys, oof, "youden"), thresholds(Ys, oof, "f1")
         th_y.append(Ty); th_f.append(Tf)
@@ -592,8 +715,7 @@ def run_one(dataset, name, make, X, Y, labels, dev, test, seed, ratio, boots, ou
         recs.append({"scheme": f"cv{k}", "fold": "pooled_oof", "threshold": Ty.tolist(),
                      **all_metrics(Ys, oof, Ty, labels)})
 
-    model = make().fit(Xs, Ys)
-    S = model.score(X[test])
+    S = next(scores)  # the final model (trained on the whole subset), scored on the test set
     mean_t = lambda L: np.where(np.isnan(m := (np.nanmean(np.vstack(L), 0) if L else np.full(len(labels), np.nan))),
                                 0.5, m)
     Ty, Tf = mean_t(th_y), mean_t(th_f)
@@ -602,10 +724,11 @@ def run_one(dataset, name, make, X, Y, labels, dev, test, seed, ratio, boots, ou
            "overall_f1thr": all_metrics(Y[test], S, Tf, labels)["overall"],
            "ci95": bootstrap_ci(Y[test], S, Ty, labels, boots),
            "ci95_f1thr": bootstrap_ci(Y[test], S, Tf, labels, boots)}
-    if hasattr(model, "k"):
-        rec["knn_k"] = int(model.k)
+    if final_k is not None:
+        rec["knn_k"] = int(final_k)
     if chosen_C is not None:
         rec["C"] = chosen_C
+    rec["n_not_converged"] = int(n_nc + n_nc_csearch)  # solver convergence warnings across all fits of this size
     recs.append(rec)
     np.savez_compressed(os.path.join(out_dir, "scores", f"{name}_s{seed}_r{int(round(ratio * 100)):03d}.npz"),
                         y=Y[test], s=S, t=Ty, t_f1=Tf)

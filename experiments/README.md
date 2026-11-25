@@ -30,8 +30,8 @@ Useful flags: `--models LR KNN MLP-focal` (subset of models), `--ratios 0.01 0.0
 
 | Name | What it is |
 |---|---|
-| `LR` | Logistic regression (linear probe). C re-selected on each training subset |
-| `SVM` | ICH: linear SVM (C grid capped at 1; runs last); SinoCT: RBF SVM (as in the deck). C re-selected on each training subset; Platt-calibrated (3-fold sigmoid) so thresholds transfer from CV to the final model |
+| `LR` | Logistic regression (linear probe), exact `newton-cholesky` solver. C re-selected on each training subset from 1e-4 to 1 (larger C is numerically ill-determined on these collinear embeddings: solvers disagree) |
+| `SVM` | ICH: linear SVM (squared hinge, same model as `LinearSVC(dual=False)`, solved exactly by Newton's method: `NewtonLinearSVC`; runs last); SinoCT: RBF SVM (as in the deck). C re-selected on each training subset; Platt-calibrated (3-fold sigmoid) so thresholds transfer from CV to the final model |
 | `KNN` | Cosine k-NN, distance-weighted; k re-selected inside every fit (3-fold CV) |
 | `RF`, `XGB` | Random forest, XGBoost (grids from `NewICHModels.py`) |
 | `MLP` | MLP with architecture/lr from a fresh Optuna search on the dev pool (same search space as `MLP_Optimized.ipynb`) |
