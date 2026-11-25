@@ -550,9 +550,11 @@ def keep_awake():
     if os.name == "nt":
         try:
             import ctypes
-            ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
-            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
-            print("[keep-awake] Windows sleep blocked while this run is active", flush=True)
+            # DISPLAY_REQUIRED matters on Modern Standby laptops: a screen-off timeout there drops the
+            # machine into standby (and powers down USB/Thunderbolt drives) even with sleep disabled.
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000001, 0x00000002
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+            print("[keep-awake] sleep and screen-off blocked while this run is active", flush=True)
         except Exception as e:  # never fail a run over this
             print(f"[keep-awake] could not block sleep: {e}", flush=True)
 
