@@ -21,7 +21,12 @@ import os
 import sys
 import time
 
+import warnings
+
 import numpy as np
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scaling_cv as S  # noqa: E402

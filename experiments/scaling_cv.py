@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import time
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -33,13 +34,19 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC, LinearSVC
 
+from sklearn.exceptions import ConvergenceWarning
+
+# Weakly regularized fits that hit max_iter only cost time; they never win the 1-SE C selection.
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SEED = 42
 RATIOS = [0.01, 0.02, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 1.00]
 FOLDS = [3, 5, 10]
 ICH_LABELS = ["any", "epidural", "intraparenchymal", "intraventricular", "subarachnoid", "subdural"]
 DEFAULT_MODELS = {
-    "ich": ["LR", "SVM", "KNN", "RF", "XGB", "MLP", "MLP-focal", "MLP5", "MLP7"],
+    # ICH: SVM last, so the slowest model can't hold up the others
+    "ich": ["LR", "KNN", "RF", "XGB", "MLP", "MLP-focal", "MLP5", "MLP7", "SVM"],
     "sino": ["LR", "SVM", "KNN", "RF", "XGB", "MLP", "MLP-focal", "MLP3", "MLP5"],
 }
 DEFAULT_MODELS["ich_study"] = DEFAULT_MODELS["ich"]
@@ -339,6 +346,9 @@ def load_params(dataset):
 
 C_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1, 10, 100)
 RBF_C_GRID = (0.1, 0.3, 1, 3, 10)
+# ICH linear SVM: at C >= 10 liblinear barely converges on 1,408 dims (one calibrated 6-label fit > 8 min at 20% of
+# the data, vs ~1.5 min at C=1), and for a hinge loss C >= 10 is effectively unregularized. LR keeps the full grid.
+ICH_SVM_C_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1)
 PER_SIZE_C = {"LR", "SVM"}  # regularization strength re-selected on each training subset
 
 
@@ -349,7 +359,13 @@ def select_C(dataset, name, device, seed, params, X, Y):
     y0 = Y[:, 0].astype(int)
     if np.bincount(y0, minlength=2).min() < 3:
         return None
-    grid = RBF_C_GRID if (dataset == "sino" and name.partition("-")[0] == "SVM") else C_GRID
+    base = name.partition("-")[0]
+    if base == "SVM" and dataset == "sino":
+        grid = RBF_C_GRID
+    elif base == "SVM" and dataset.startswith("ich"):
+        grid = ICH_SVM_C_GRID
+    else:
+        grid = C_GRID
     folds = list(StratifiedKFold(3, shuffle=True, random_state=seed).split(X, y0))
     stats = []
     for C in grid:  # ascending C = decreasing regularization
@@ -358,7 +374,8 @@ def select_C(dataset, name, device, seed, params, X, Y):
         for tr, va in folds:
             if y0[va].min() == y0[va].max():
                 continue
-            aucs.append(roc_auc_score(y0[va], make().fit(X[tr], Y[tr]).score(X[va])[:, 0]))
+            # only the first label is scored, so only fit that one (6x less work for ICH; same C chosen)
+            aucs.append(roc_auc_score(y0[va], make().fit(X[tr], Y[tr][:, :1]).score(X[va])[:, 0]))
         stats.append((C, np.mean(aucs), np.std(aucs, ddof=1) / np.sqrt(len(aucs)) if len(aucs) > 1 else 0.0))
     best = max(stats, key=lambda t: t[1])
     return next(C for C, mu, _ in stats if mu >= best[1] - best[2])
