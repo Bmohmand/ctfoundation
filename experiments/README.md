@@ -79,6 +79,14 @@ SinoCT (balanced classes).
 - **Metrics.** ROC AUC, PR AUC (AP), prevalence-normalized PR skill = (AP - prevalence)/(1 - prevalence),
   accuracy, sensitivity, specificity, precision, F1. ICH metrics are macro averages over the six labels.
 
+## Aside: how much of the embedding is used? (`pca_probe.py`)
+
+`python experiments/pca_probe.py --dataset sino` (and `ich`) fits logistic regression on the top-k principal
+components of the embedding (scaler + PCA fit on the development pool, same fixed test set). On both datasets
+20 of 1,408 components hold 95% of the variance; 32 (SinoCT) / 64 (ICH) components match the full vector
+within 0.005 AUC, and 2 components already give 0.82 on SinoCT. The usable signal is low-dimensional and close
+to linearly separable, which is why all decoders tie. Writes `results/<dataset>/report/pca_probe.{csv,md,png}`.
+
 ## ICH label check (`ich_study` sensitivity variant)
 
 `data/rsna_ich_id_map.csv` maps every ICH embedding row to its RSNA patient, built from the old
